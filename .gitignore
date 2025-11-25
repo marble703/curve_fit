@@ -6,5 +6,7 @@ build
 install
 log
 
+data/
+
 *.pdf
 *.pyc
