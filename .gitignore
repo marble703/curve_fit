@@ -8,5 +8,5 @@ log
 
 data/
 
-*.pdf
+*.txt
 *.pyc
