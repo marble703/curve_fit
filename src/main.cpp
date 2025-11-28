@@ -8,25 +8,31 @@
 #include <opencv2/opencv.hpp>
 #include <ceres/ceres.h>
 
-// Simple residual for (x,z) given timestamp
+// τ-parameterized residual: no dependence on absolute time
+// Model: x(τ) = x0 + sigma_x * (1 - exp(-τ))
+//        z(τ) = z0 + sigma_z * (1 - exp(-τ)) - sigma_g * τ + sigma_g * (1 - exp(-τ))
+// where sigma_g = g / k^2 is derived from sigma_x, sigma_z and trajectory geometry
+// τ_i = i * delta_tau for equally spaced observations
 struct TrajResidual {
-    TrajResidual(double x_obs, double z_obs, double t, double x0, double z0)
-        : x_obs_(x_obs), z_obs_(z_obs), time_(t), x0_(x0), z0_(z0) {}
+    TrajResidual(double x_obs, double z_obs, int index, double x0, double z0)
+        : x_obs_(x_obs), z_obs_(z_obs), index_(index), x0_(x0), z0_(z0) {}
 
     template <typename T>
     bool operator()(const T* const params, T* residuals) const {
-        const T vx0 = params[0];
-        const T vz0 = params[1];
-        const T logk = params[2];
-        const T k = ceres::exp(logk);
-        const T t = T(time_);
-        const T exp_term = ceres::exp(-k * t);
+        // params: [sigma_x, sigma_z, log_delta_tau, log_sigma_g]
+        const T sigma_x = params[0];
+        const T sigma_z = params[1];
+        const T log_delta_tau = params[2];
+        const T log_sigma_g = params[3];
+        const T delta_tau = ceres::exp(log_delta_tau);
+        const T sigma_g = ceres::exp(log_sigma_g);
+        
+        const T tau = T(index_) * delta_tau;
+        const T exp_term = ceres::exp(-tau);
         const T one_minus = T(1.0) - exp_term;
-        const T invk = T(1.0) / k;
-        const T g = T(9.81);
 
-        T x_model = T(x0_) + vx0 * invk * one_minus;
-        T z_model = T(z0_) + vz0 * invk * one_minus - (g / k) * t + (g / (k * k)) * one_minus;
+        T x_model = T(x0_) + sigma_x * one_minus;
+        T z_model = T(z0_) + sigma_z * one_minus - sigma_g * tau + sigma_g * one_minus;
 
         residuals[0] = T(x_obs_) - x_model;
         residuals[1] = T(z_obs_) - z_model;
@@ -34,7 +40,9 @@ struct TrajResidual {
     }
 
 private:
-    const double x_obs_, z_obs_, time_, x0_, z0_;
+    const double x_obs_, z_obs_;
+    const int index_;
+    const double x0_, z0_;
 };
 
 // Read UV points from a text file: each line "u v"
@@ -193,36 +201,33 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Optional undistort: convert to normalized image points then to pixels
-    std::vector<cv::Point2d> undistorted = pixels;
+    // Undistort and get normalized camera coordinates
+    // undistortPoints outputs normalized coords directly (no need to multiply by K then K^{-1})
+    std::vector<cv::Point2d> norm_pts(N);
     if (!dist.empty()) {
-        // undistortPoints yields normalized coords; convert back to pixel coords
-        std::vector<cv::Point2d> norm_pts;
         cv::undistortPoints(pixels, norm_pts, K, dist);
+    } else {
+        // No distortion: manually convert pixels to normalized coords
+        cv::Mat K_inv_tmp = K.inv();
         for (int i = 0; i < N; ++i) {
-            cv::Point2d p = norm_pts[i];
-            // back to pixel coordinates: [u v 1]^T = K * [x y 1]^T
-            cv::Mat pt = (cv::Mat_<double>(3,1) << p.x, p.y, 1.0);
-            cv::Mat pix = K * pt;
-            undistorted[i].x = pix.at<double>(0,0) / pix.at<double>(2,0);
-            undistorted[i].y = pix.at<double>(1,0) / pix.at<double>(2,0);
+            cv::Mat uv = (cv::Mat_<double>(3,1) << pixels[i].x, pixels[i].y, 1.0);
+            cv::Mat nc = K_inv_tmp * uv;
+            norm_pts[i].x = nc.at<double>(0,0) / nc.at<double>(2,0);
+            norm_pts[i].y = nc.at<double>(1,0) / nc.at<double>(2,0);
         }
     }
 
-    // Backproject pixels to plane Y=0 using ray-plane intersection
-    // Camera model: P_cam = R * P_world + t  => P_world = R^T (P_cam - t) = R^T P_cam - R^T t
-    // Camera center in world: C_world = -R^T t
-    // Ray direction in camera: d_cam = K^{-1} [u,v,1]^T
-    // Ray direction in world : d_world = R^T d_cam
+    // Backproject normalized coords to plane Y=0 using ray-plane intersection
+    // Ray direction in camera (normalized coords): d_cam = [nx, ny, 1]^T
+    // Ray direction in world: d_world = R^T * d_cam
+    // Camera center in world: C_world = -R^T * t
     // Ray: P(s) = C_world + s * d_world; set Y=0 => s = -C_world.y / d_world.y
-    cv::Mat K_inv = K.inv();
     cv::Mat R_t = R.t();
     cv::Mat C_world = -R_t * t; // 3x1
 
     std::vector<double> xs(N), zs(N);
     for (int i = 0; i < N; ++i) {
-        cv::Mat uv = (cv::Mat_<double>(3,1) << undistorted[i].x, undistorted[i].y, 1.0);
-        cv::Mat d_cam = K_inv * uv;
+        cv::Mat d_cam = (cv::Mat_<double>(3,1) << norm_pts[i].x, norm_pts[i].y, 1.0);
         cv::Mat d_world = R_t * d_cam;
         double dy = d_world.at<double>(1,0);
         double Cy = C_world.at<double>(1,0);
@@ -247,20 +252,24 @@ int main(int argc, char** argv) {
     if (has_user_x0) x0 = user_x0;
     if (has_user_z0) z0 = user_z0;
 
-    double duration = times.back() - times.front();
-    if (duration <= 0.0) duration = 1.0;
-    double vx_guess = (xs.back() - xs.front()) / duration;
-    double vz_guess = (zs.back() - zs.front()) / duration;
-    if (!std::isfinite(vx_guess)) vx_guess = 5.0;
-    if (!std::isfinite(vz_guess)) vz_guess = 5.0;
-    double logk_guess = std::log(0.5);
+    // τ-parameterization: estimate sigma_x, sigma_z from trajectory span
+    // sigma_x ≈ x_final - x0, sigma_z ≈ z_max - z0 (rough estimate)
+    double sigma_x_guess = xs.back() - xs.front();
+    double sigma_z_guess = zs.back() - zs.front();
+    if (std::abs(sigma_x_guess) < 1e-6) sigma_x_guess = 1.0;
+    if (std::abs(sigma_z_guess) < 1e-6) sigma_z_guess = 1.0;
+    
+    // Initial guess for delta_tau: assume trajectory spans τ ∈ [0, ~3] (reasonable decay)
+    double log_delta_tau_guess = std::log(3.0 / std::max(1, N - 1));
+    // Initial guess for sigma_g = g/k^2: rough estimate from trajectory curvature
+    double log_sigma_g_guess = std::log(1.0);  // Will be refined by optimizer
 
-    double params[3] = {vx_guess, vz_guess, logk_guess};
+    double params[4] = {sigma_x_guess, sigma_z_guess, log_delta_tau_guess, log_sigma_g_guess};
 
     ceres::Problem problem;
     for (int i = 0; i < N; ++i) {
-        ceres::CostFunction* cost = new ceres::AutoDiffCostFunction<TrajResidual, 2, 3>(
-            new TrajResidual(xs[i], zs[i], times[i], x0, z0));
+        ceres::CostFunction* cost = new ceres::AutoDiffCostFunction<TrajResidual, 2, 4>(
+            new TrajResidual(xs[i], zs[i], i, x0, z0));
         ceres::LossFunction* loss = new ceres::HuberLoss(1.0);
         problem.AddResidualBlock(cost, loss, params);
     }
@@ -272,28 +281,43 @@ int main(int argc, char** argv) {
     ceres::Solve(options, &problem, &summary);
 
     std::cout << summary.FullReport() << std::endl;
-    double k = std::exp(params[2]);
-    double vx0 = params[0];
-    double vz0 = params[1];
-    double sigma = 9.81 / (k * k);
-    std::cout << "Estimated parameters:\n";
-    std::cout << " vx0  = " << vx0 << " m/s\n";
-    std::cout << " vz0  = " << vz0 << " m/s\n";
-    std::cout << " k    = " << k << " (b/m)\n";
-    std::cout << " sigma= " << sigma << "\n";
+    
+    // Extract τ-parameterized results
+    double sigma_x = params[0];
+    double sigma_z = params[1];
+    double delta_tau = std::exp(params[2]);
+    double sigma_g = std::exp(params[3]);
+    
+    // Recover physical parameters (if time scale is known)
+    // sigma_g = g / k^2  =>  k = sqrt(g / sigma_g)
+    // sigma_x = vx0 / k  =>  vx0 = sigma_x * k
+    // sigma_z = vz0 / k  =>  vz0 = sigma_z * k
+    double g = 9.81;
+    double k_recovered = std::sqrt(g / sigma_g);
+    double vx0_recovered = sigma_x * k_recovered;
+    double vz0_recovered = sigma_z * k_recovered;
+    
+    std::cout << "\nEstimated τ-parameterized results (time-independent):\n";
+    std::cout << " sigma_x   = " << sigma_x << " m (characteristic x-displacement)\n";
+    std::cout << " sigma_z   = " << sigma_z << " m (characteristic z-displacement)\n";
+    std::cout << " delta_tau = " << delta_tau << " (dimensionless time step)\n";
+    std::cout << " sigma_g   = " << sigma_g << " m (gravity length scale = g/k^2)\n";
+    std::cout << "\nRecovered physical parameters (assuming g=9.81 m/s^2):\n";
+    std::cout << " k    = " << k_recovered << " 1/s (drag coefficient)\n";
+    std::cout << " vx0  = " << vx0_recovered << " m/s\n";
+    std::cout << " vz0  = " << vz0_recovered << " m/s\n";
 
-    // Output fitted trajectory (sampled)
+    // Output fitted trajectory (sampled using τ parameterization)
     std::ofstream ofs("fitted_traj.txt");
     const int samples = 50;
-    double t_min = times.front();
-    double t_max = times.back();
+    double tau_max = (N - 1) * delta_tau;  // Total τ span
     for (int i = 0; i < samples; ++i) {
-        double t = t_min;
-        if (samples > 1) t = t_min + (t_max - t_min) * double(i) / double(samples - 1);
-        double exp_term = std::exp(-k * t);
+        double tau = 0.0;
+        if (samples > 1) tau = tau_max * double(i) / double(samples - 1);
+        double exp_term = std::exp(-tau);
         double one_minus = 1.0 - exp_term;
-        double x = x0 + vx0 / k * one_minus;
-        double z = z0 + vz0 / k * one_minus - (9.81 / k) * t + (9.81 / (k * k)) * one_minus;
+        double x = x0 + sigma_x * one_minus;
+        double z = z0 + sigma_z * one_minus - sigma_g * tau + sigma_g * one_minus;
         ofs << x << " " << z << "\n";
     }
     ofs.close();

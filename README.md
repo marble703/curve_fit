@@ -39,8 +39,8 @@ make -j
 # 生成数据，保存在 data/ 目录下
 python3 scripts/generate_data.py \
     --out-prefix data/test \
-    --vx0 15.0 --vz0 15.0 --k 0.5 \
-    --pixel-noise 0.5
+    --vx0 10.0 --vz0 10.0 --k 0.5 \
+    --pixel-noise 2 --world-noise 0.05
 ```
 
 这将生成：
@@ -51,14 +51,14 @@ python3 scripts/generate_data.py \
 
 ### 2. 运行轨迹拟合 (C++)
 
-运行编译好的 `curve_fit` 程序进行参数估计。
+运行编译好的 `curve_fit` 程序进行参数估计(--time 参数已弃用， 现在是否传入不影响结果)。
 
 ```bash
 # 基本用法
-./build/curve_fit data/test_camera.yml data/test_pixels.txt --times data/test_times.txt
+./build/curve_fit data/test_camera.yml data/test_pixels.txt
 
 # 可选参数: 指定起始点猜测 (x0, z0)
-./build/curve_fit data/test_camera.yml data/test_pixels.txt --times data/test_times.txt --x0 0.0 --z0 0.0
+./build/curve_fit data/test_camera.yml data/test_pixels.txt --x0 0.4 --z0 0.0
 ```
 
 **注意**: 强烈建议提供 `--times` 参数。如果不提供时间戳，程序将假设点之间是等时间间距的，这可能导致恢复出的物理参数（特别是阻力系数 $k$）与真实值存在比例偏差。
