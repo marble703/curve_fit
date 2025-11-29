@@ -8,5 +8,5 @@ find_package(OpenCV REQUIRED)
 find_package(Ceres REQUIRED)
 
 add_executable(curve_fit src/main.cpp)
-target_include_directories(curve_fit PRIVATE ${OpenCV_INCLUDE_DIRS} ${CERES_INCLUDE_DIRS})
+target_include_directories(curve_fit PRIVATE ${OpenCV_INCLUDE_DIRS} ${CERES_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(curve_fit PRIVATE ${OpenCV_LIBS} ${CERES_LIBRARIES})
